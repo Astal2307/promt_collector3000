@@ -25,15 +25,19 @@ class MultiStepResult:
     
 @dataclass
 class StepMetrics:
-    mape: float
+    smape: float
     direction_accuracy: float
+    mae: float
+    rmse: float
     samples: int
 
 @dataclass
 class OverallMetrics:
     total_predictions: int
-    avg_mape: float
+    avg_smape: float
     avg_direction_accuracy: float
+    avg_mae: float
+    avg_rmse: float
     step_metrics: Dict[str, StepMetrics]
 
 class Tester:
@@ -78,20 +82,35 @@ class Tester:
             ]
         }
     
-    async def get_response(self, question_text, temperature=0.6, max_tokens=50):
-        if self.model == "gpt-oss:120b-cloud":
-            # Используем run_in_executor для синхронного вызова ollama
+    async def get_response(self, question_text, temperature=0.2, max_tokens=50):
+        if self.model == "gpt-oss:120b-cloud" or self.model == "qwen3-vl:235b-cloud":
+
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: ollama.generate(model=self.model, prompt=question_text)
+                lambda: ollama.generate(model=self.model, prompt=question_text, options={"temperature": temperature}, think="high")
             )
 
-            # print(f"ollama response: \n{response.response}\n\n")
+            i = 1
+            response_limit = 5
+            while not self._extract_prediction(response.response):
+                response = await loop.run_in_executor(
+                    None,
+                    lambda: ollama.generate(model=self.model, prompt=question_text, options={"temperature": temperature}, think="high")
+                )
+                print(f"ATTEMPT {i}: {response.response}")
+                i += 1
+                if i > response_limit:
+                    break
+
+            print('==============================================================================')
+            print(f'PROMPT: \n{question_text}\n')
+            print('==============================================================================\n\n')
+            print(f"OLLAMA RESPONSE: \n{response.response}\n")
+            print('==============================================================================\n\n')
             return response.response
 
         elif self.model == "gemma3":
-            # Используем run_in_executor для синхронного вызова ollama.chat
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
@@ -105,7 +124,6 @@ class Tester:
                 headers = await self._prepare_headers()
                 data = await self._prepare_request_data(question_text, temperature, max_tokens)
                 
-                # Используем aiohttp вместо requests
                 async with self.session.post(
                     self.api_url, 
                     headers=headers, 
@@ -126,10 +144,10 @@ class Tester:
                 return "Извините, произошла ошибка при обработке запроса."
     
     async def test_prompt_on_dataset(self, user_prompt: str, test_dataset: List[Dict], 
-                               horizon: int = 10) -> Dict[str, any]:
+                               horizon: int = 5) -> Dict[str, any]:
         if not self.session:
             self.session = aiohttp.ClientSession()
-        
+
         tasks = []
         for test_case in test_dataset:
             task = self._process_test_case(user_prompt, test_case, horizon)
@@ -157,6 +175,11 @@ class Tester:
         
         if predictions:
             actual_prices = await self._get_actual_prices(test_case, horizon)
+
+            print('==============================================================================\n')
+            print("REAL PRICES:")
+            print('\n'.join(list(map(str, actual_prices))), '\n')
+            print('==============================================================================\n')
             
             return MultiStepResult(
                 actual_prices=actual_prices,
@@ -177,14 +200,13 @@ class Tester:
         response = await self.get_response(full_prompt)
         predicted_prices = self._extract_prediction(response)
         
-        if None in predicted_prices:
-            logging.warning(f"Не удалось извлечь предсказание на шаге {predicted_prices.index(None) + 1}")
+        if not predicted_prices:
+            print(f"Не удалось извлечь предсказание")
             return None
         
         return predicted_prices
 
     def _build_prediction_prompt(self, user_prompt: str, context_data: str, horizon: int) -> str:
-        """Синхронный метод для создания промпта"""
         return f"""
 {user_prompt}
 
@@ -197,25 +219,23 @@ class Tester:
 - Каждое числовое значение верни на новой строке в формате: 123.45
 - Не добавляй пояснений, текста или символов
 
+ЕЩЕ РАЗ: В ОТВЕТЕ УКАЖИ **ТОЛЬКО 5 ЧИСЕЛ - ПРЕДСКАЗАННЫЕ ЦЕНЫ ЗАКРЫТИЯ**
+
 Твой прогноз:
 """
 
     def _extract_prediction(self, response):
-        """Синхронный метод для извлечения предсказаний"""
         try:
-            # Разделяем строки и пытаемся преобразовать в числа
             lines = response.strip().split('\n')
             predictions = []
             for line in lines:
                 line = line.strip()
                 if line:
-                    # Убираем возможные лишние символы
                     line = line.replace(',', '.').strip()
                     try:
                         pred = float(line)
                         predictions.append(pred)
                     except ValueError:
-                        # Пропускаем строки, которые нельзя преобразовать в число
                         continue
             return predictions
         except Exception as e:
@@ -223,7 +243,6 @@ class Tester:
             return []
 
     def _generate_next_timestamp(self, last_timestamp: str, interval: str) -> str:
-        """Синхронный метод для генерации временной метки"""
         from datetime import datetime, timedelta
 
         try:
@@ -237,7 +256,7 @@ class Tester:
             elif interval == "1w":
                 next_dt = last_dt + timedelta(weeks=1)
             else:
-                next_dt = last_dt + timedelta(hours=1)  # по умолчанию 1 час
+                next_dt = last_dt + timedelta(hours=1)
             
             return next_dt.strftime(format_string)
         except Exception as e:
@@ -245,7 +264,6 @@ class Tester:
             return last_timestamp
 
     async def _get_actual_prices(self, test_case: Dict, horizon: int) -> List[float]:
-        """Асинхронное получение фактических цен"""
         symbol = test_case['symbol']
         interval = test_case['interval']
         start_date = test_case['timestamp']
@@ -256,7 +274,6 @@ class Tester:
         for i in range(horizon):
             new_date = self._generate_next_timestamp(prev_date, interval)
             
-            # Используем run_in_executor для синхронного вызова select
             loop = asyncio.get_event_loop()
             rows = await self.db_controller.select(
                 "candles", 
@@ -265,11 +282,10 @@ class Tester:
             )
             
             if rows and len(rows) > 0:
-                price = float(rows[0][4])  # close price (индекс 4 в candles)
+                price = float(rows[0][4])
                 actual_prices.append(price)
                 prev_date = new_date
             else:
-                # Если данных нет, используем последнюю известную цену или 0
                 if actual_prices:
                     actual_prices.append(actual_prices[-1])
                 else:
@@ -278,68 +294,107 @@ class Tester:
         return actual_prices
 
     def _calculate_multistep_metrics(self, results: List[MultiStepResult]) -> OverallMetrics:
-        """Синхронный метод для расчета метрик"""
         if not results:
+            return None
             return OverallMetrics(0, 0.0, 0.0, {})
         
-        step_metrics = {}
-        all_mape_errors = []
-        all_directions = []
-        total_predictions = 0
+        horizon = results[0].horizon
+        n_samples = len(results)
         
-        horizon = results[0].horizon if results else 0
+        actual_array = np.zeros((n_samples, horizon))
+        pred_array = np.zeros((n_samples, horizon))
+        
+        for i, result in enumerate(results):
+            actual_len = min(horizon, len(result.actual_prices))
+            pred_len = min(horizon, len(result.predicted_prices))
+            actual_array[i, :actual_len] = result.actual_prices[:actual_len]
+            pred_array[i, :pred_len] = result.predicted_prices[:pred_len]
+        
+        valid_mask = actual_array != 0
+        
+        errors = actual_array - pred_array
+        abs_errors = np.abs(errors)
+        
+        step_mae = np.zeros(horizon)
+        step_rmse = np.zeros(horizon)
+        step_smape = np.zeros(horizon)
+        step_direction_acc = np.zeros(horizon)
         
         for step in range(horizon):
-            step_mape_errors = []
-            step_directions = []
-            step_samples = 0
-            
-            for result in results:
-                if (step < len(result.predicted_prices) and 
-                    step < len(result.actual_prices) and
-                    result.actual_prices[step] != 0):
-                    
-                    actual = result.actual_prices[step]
-                    predicted = result.predicted_prices[step]
-                    
-                    # MAE
-                    mae_error = abs(actual - predicted)
-                    
-                    # MAPE
-                    mape_error = mae_error / actual
-                    step_mape_errors.append(mape_error)
-                    all_mape_errors.append(mape_error)
-                    
-                    # Direction accuracy
-                    if step > 0 and len(result.actual_prices) > step:
-                        actual_dir = 1 if actual > result.actual_prices[step-1] else 0
-                        predicted_dir = 1 if predicted > result.predicted_prices[step-1] else 0
-                        dir_correct = 1 if actual_dir == predicted_dir else 0
-                        step_directions.append(dir_correct)
-                        all_directions.append(dir_correct)
-                    
-                    step_samples += 1
-            
-            step_metrics[f'step_{step}'] = StepMetrics(
-                mape=np.mean(step_mape_errors) * 100 if step_mape_errors else 0.0,
-                direction_accuracy=np.mean(step_directions) if step_directions else 0.0,
-                samples=step_samples
-            )
-            
-            total_predictions += step_samples
+            mask = valid_mask[:, step]
+            if np.any(mask):
+                # MAE
+                step_mae[step] = np.mean(abs_errors[mask, step])
+                
+                # RMSE
+                step_rmse[step] = np.sqrt(np.mean(errors[mask, step] ** 2))
+                
+                # SMAPE
+                a = actual_array[mask, step]
+                p = pred_array[mask, step]
+                denominator = np.abs(a) + np.abs(p)
+                denominator[denominator == 0] = 1
+                step_smape[step] = np.mean(2 * np.abs(a - p) / denominator) * 100
         
-        overall_mape = np.mean(all_mape_errors) * 100 if all_mape_errors else 0.0
-        overall_direction = np.mean(all_directions) if all_directions else 0.0
+        # DA
+        if horizon > 1:
+            actual_dir = np.sign(actual_array[:, 1:] - actual_array[:, :-1])
+            pred_dir = np.sign(pred_array[:, 1:] - pred_array[:, :-1])
+            
+            for step in range(1, horizon):
+                mask = valid_mask[:, step] & valid_mask[:, step-1]
+                if np.any(mask):
+                    matches = (actual_dir[:, step-1] == pred_dir[:, step-1])[mask]
+                    step_direction_acc[step] = np.mean(matches) if len(matches) > 0 else 0.0
+        
+        
+        valid_errors = errors[valid_mask]
+        
+        if len(valid_errors) > 0:
+            overall_mae = np.mean(np.abs(valid_errors))
+            
+            overall_rmse = np.sqrt(np.mean(valid_errors ** 2))
+            
+            valid_actual = actual_array[valid_mask]
+            valid_pred = pred_array[valid_mask]
+            denominator = np.abs(valid_actual) + np.abs(valid_pred)
+            denominator[denominator == 0] = 1
+            overall_smape = np.mean(2 * np.abs(valid_errors) / denominator) * 100
+            
+            if horizon > 1:
+                dir_mask = valid_mask[:, 1:] & valid_mask[:, :-1]
+                actual_dir_valid = actual_dir[dir_mask]
+                pred_dir_valid = pred_dir[dir_mask]
+                overall_direction = np.mean(actual_dir_valid == pred_dir_valid) if len(actual_dir_valid) > 0 else 0.0
+            else:
+                overall_direction = 0.0
+        else:
+            overall_mae = 0.0
+            overall_rmse = 0.0
+            overall_smape = 0.0
+            overall_direction = 0.0
+        
+        step_metrics = {}
+        for step in range(horizon):
+            mask = valid_mask[:, step]
+            step_metrics[f'step_{step}'] = StepMetrics(
+                smape=step_smape[step],
+                direction_accuracy=step_direction_acc[step] if horizon > 1 else 0.0,
+                mae=step_mae[step],
+                rmse=step_rmse[step],
+                samples=int(np.sum(mask))
+            )
         
         return OverallMetrics(
-            total_predictions=total_predictions,
-            avg_mape=overall_mape,
+            total_predictions=int(np.sum(valid_mask)),
+            avg_smape=overall_smape,
             avg_direction_accuracy=overall_direction,
+            avg_mae=overall_mae,
+            avg_rmse=overall_rmse,
             step_metrics=step_metrics
         )
 
     def generate_report(self, test_results: Dict) -> str:
-        """Генерирует отчет о тестировании промпта"""
         metrics = test_results['metrics']
         
         report = f"""
@@ -372,7 +427,6 @@ if __name__ == "__main__":
     
     async def test_main():
         async with Tester(IAM_TOKEN, FOLDER_ID, MODEL_URI, db_controller) as tester:
-            # Получаем данные через run_in_executor
             loop = asyncio.get_event_loop()
             test_dataset = await loop.run_in_executor(
                 None,

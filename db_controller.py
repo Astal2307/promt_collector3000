@@ -137,34 +137,27 @@ class DBController:
                 "exchange": exch
             })
     
-    async def sample_data(self, horizon: int = 1, symbols: List[str] = None, 
-                         interval: str = None, window_size: int = 20, 
-                         num_samples: int = 20, test_period_days: int = 365) -> List[Dict]:
+    async def sample_data(self, symbol, interval='1d', horizon: int = 1,
+                         window_size: int = 100, num_samples: int = 20, test_period_days: int = 365) -> List[Dict]:
         
         if self.conn is None:
             await self.connect()
-
-        horizon = 1
-        symbols = [ticker[0] for ticker in TOP50_TICKERS]
         
         samples = []
-        samples_per_symbol = max(1, num_samples // len(symbols))
-        
-        for symbol in symbols:
-            if interval is None:
-                interval_s = random.choice(["1h", "1d", "1w"])
-            
-            symbol_samples = await self._generate_samples_for_symbol(
-                symbol=symbol,
-                interval=interval_s,
-                horizon=horizon,
-                window_size=window_size,
-                samples_per_symbol=samples_per_symbol,
-                test_period_days=test_period_days
-            )
-            samples.extend(symbol_samples)
-        
+        samples_per_symbol = num_samples
+        symbol_samples = await self._generate_samples_for_symbol(
+            symbol=symbol,
+            interval=interval,
+            horizon=horizon,
+            window_size=window_size,
+            samples_per_symbol=samples_per_symbol,
+            test_period_days=test_period_days
+        )
+        samples.extend(symbol_samples)
+
+        random.seed(42)        
         random.shuffle(samples)
+
         if len(samples) > num_samples:
             # pass
             samples = samples[:num_samples]
@@ -182,7 +175,8 @@ class DBController:
         
         samples = []
         available_indices = list(range(window_size, len(data) - horizon))
-        
+
+        random.seed(42)        
         selected_indices = random.sample(
             available_indices, 
             min(samples_per_symbol, len(available_indices))
@@ -218,11 +212,10 @@ class DBController:
                 SELECT datetime, open, high, low, close, volume 
                 FROM candles 
                 WHERE symbol = ? AND interval = ?
-                AND datetime >= datetime('now', ?)
                 ORDER BY datetime ASC
             '''
             
-            cursor = await self.conn.execute(query, [symbol, interval, f'-{days} days'])
+            cursor = await self.conn.execute(query, [symbol, interval])
             rows = await cursor.fetchall()
             await cursor.close()
             
