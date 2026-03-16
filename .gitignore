@@ -1,0 +1,15 @@
+__pycache__/
+.idea/
+
+async_test.py
+async_test.txt
+db_controller.txt
+main.tex
+main.txt
+model-00001-of-00004.safetensors
+ollama_bot.log
+plan_p2.md
+test_model.ipynb
+test_promt.py
+test_test_prompt.txt
+user_prompts.db

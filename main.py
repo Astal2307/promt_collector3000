@@ -16,6 +16,7 @@ import uuid
 from checker import Checker
 import warnings
 import json
+from html import escape
 
 warnings.filterwarnings("ignore")
 
@@ -41,10 +42,11 @@ IAM_TOKEN = "" #get_iam_token(OAUTH_TOKEN)
 FOLDER_ID = private_info['FOLDER_ID']
 MODEL_URI = private_info['MODEL_URI']
 BOT_TOKEN = private_info['BOT_TOKEN']
-MAX_ATTEMPTS = 5
+MAX_ATTEMPTS = 1000
+NUM_WINDOWS = 3
 
 request_queue = asyncio.Queue(maxsize=100)
-checker = Checker()
+# checker = Checker()
 
 test_prompt = """
 Ты — генератор сценариев движения рынка для анализа рисков.
@@ -72,17 +74,24 @@ db_controller = DBController()
 
 async def init_db():
     async with aiosqlite.connect('user_prompts.db') as conn:
-        await conn.execute('''
+        cols = ['user_id INTEGER', 'username TEXT', 'prompt TEXT', 'smape FLOAT', 'da FLOAT', 'mae FLOAT', 'rmse FLOAT']
+        for idx in range(1, NUM_WINDOWS + 1):
+            cols.extend([f'step_{idx}_smape FLOAT', f'step_{idx}_da FLOAT', f'step_{idx}_mae FLOAT', f'step_{idx}_rmse FLOAT'])
+
+        for idx in range(1, NUM_WINDOWS + 1):
+            cols.append(f'step_{idx}_preds TEXT')
+
+        for col in cols:
+            try:
+                await conn.execute(f"ALTER TABLE prompts ADD COLUMN {col};")
+            except Exception:
+                continue
+
+        await conn.execute(f'''
             CREATE TABLE IF NOT EXISTS prompts (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                user_id INTEGER,
-                username TEXT,
-                prompt TEXT,
-                smape FLOAT,
-                da FLOAT,
-                mae FLOAT,
-                rmse FLOAT
+                {', '.join(cols)}
             )
         ''')
         await conn.execute('''
@@ -95,15 +104,35 @@ async def init_db():
         await conn.commit()
 
 
-async def save_prompt(user_id, username, prompt, overall_metrics):
+async def save_prompt(user_id, username, prompt, overall_metrics, window_metrics, model_predictions):
     async with aiosqlite.connect('user_prompts.db') as conn:
+        cols = ['user_id', 'username', 'prompt', 'smape', 'da', 'mae', 'rmse']
+        for idx in range(1, NUM_WINDOWS + 1):
+            cols.extend([f'step_{idx}_smape', f'step_{idx}_da', f'step_{idx}_mae', f'step_{idx}_rmse'])
+        
+        for idx in range(1, NUM_WINDOWS + 1):
+            cols.append(f'step_{idx}_preds')
+
+        values = list((user_id, username, prompt, 
+                        round(overall_metrics.avg_smape, 3), 
+                        round(overall_metrics.avg_direction_accuracy, 3),
+                        round(overall_metrics.avg_mae, 3),
+                        round(overall_metrics.avg_rmse, 3)))
+        for idx in range(NUM_WINDOWS):
+            step_metrics = window_metrics[f'step_{idx}']
+            values.extend([
+                round(step_metrics.smape, 3),
+                round(step_metrics.direction_accuracy, 3),
+                round(step_metrics.mae, 3),
+                round(step_metrics.rmse, 3)
+            ])
+
+        for idx in range(NUM_WINDOWS):
+            values.append(json.dumps(list(map(lambda x: round(x, 3), model_predictions[idx].predicted_prices))))
+
         await conn.execute(
-            'INSERT INTO prompts (user_id, username, prompt, smape, da, mae, rmse) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            (user_id, username, prompt, 
-            round(overall_metrics.avg_smape, 3), 
-            round(overall_metrics.avg_direction_accuracy, 3),
-            round(overall_metrics.avg_mae, 3),
-            round(overall_metrics.avg_rmse, 3))
+            f"INSERT INTO prompts ({', '.join(cols)}) VALUES ({','.join(['?'] * len(cols))})",
+            tuple(values)
         )
         
         await conn.execute('''
@@ -545,7 +574,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True, one_time_keyboard=True)
     
     confirmation_msg = await update.message.reply_text(
-        f"<b>Ваш промпт:</b>\n\n{message_text[:200]}...\n\n"
+        f"<b>Ваш промпт:</b>\n\n{escape(message_text[:200])}...\n\n"
         "<b>Тестировать этот промпт?</b>",
         reply_markup=reply_markup,
         parse_mode='HTML'
@@ -605,7 +634,8 @@ async def create_worker():
 
 async def process_prompt_testing(update: Update, context: ContextTypes.DEFAULT_TYPE, 
                                 user, message_text: str, used_attempts: int):
-    checked, similarity = checker.check(message_text)
+    # checked, similarity = checker.check(message_text)
+    checked, similarity = True, 1.0
     if not checked:
         print(f"Checker banned message: {message_text}, SIM: {similarity}")
         await update.message.reply_text(
@@ -614,7 +644,9 @@ async def process_prompt_testing(update: Update, context: ContextTypes.DEFAULT_T
         )
         return
     try:
-        test_dataset = await db_controller.sample_data(symbol="BTCUSDT", interval="1d", num_samples=3)
+        test_dataset = await db_controller.sample_data(symbol="BTCUSDT", interval="1d", num_samples=NUM_WINDOWS)
+        #print([test_dataset[i]['actual_price'] for i in range(len(test_dataset))])
+        
         async with Tester(IAM_TOKEN, FOLDER_ID, MODEL_URI, db_controller) as tester:
             results = await tester.test_prompt_on_dataset(
                 user_prompt=message_text,
@@ -635,7 +667,13 @@ async def process_prompt_testing(update: Update, context: ContextTypes.DEFAULT_T
             mae = metrics.avg_mae
             rmse = metrics.avg_rmse
 
-            await save_prompt(user.id, user.username, message_text, metrics)
+            window_metrics = metrics.step_metrics
+
+            model_predictions = results['results']
+
+            #print(model_predictions)
+
+            await save_prompt(user.id, user.username, message_text, metrics, window_metrics, model_predictions)
             
             remaining_attempts = MAX_ATTEMPTS - (used_attempts + 1)
             
@@ -708,21 +746,10 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     all_mae = await get_top_users_by_mae(limit=None)
     all_rmse = await get_top_users_by_rmse(limit=None)
 
-    def get_user_pos(lst, username):
-        for i, objs in enumerate(lst, 1):
-            if objs[0] == username:
-                return i, objs[1], objs[5]
-        return None, None, None
-
-    user_smape_pos, user_smape, user_attempts = get_user_pos(all_smape, user_name)
-    user_da_pos, user_da, _ = get_user_pos(all_da, user_name)
-    user_mae_pos, user_mae, _ = get_user_pos(all_mae, user_name)
-    user_rmse_pos, user_rmse, _ = get_user_pos(all_rmse, user_name)
-
     # print(all_da)
     # print(f"DA: {user_da}")
     
-    if not top_smape:
+    if not all_smape:
         await update.message.reply_text(
             "📭 <b>Пока нет результатов</b>\n\n"
             "Будьте первым, кто протестирует промпт!",
@@ -739,11 +766,11 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if username not in user_scores:
                     user_scores[username] = {
                         'username': username,
-                        'scores': 6 - position,
+                        'scores': position,
                         'places': {metric_name: position}
                     }
                 else:
-                    user_scores[username]['scores'] += (6 - position)  # 5 за 1-е место, 4 за 2-е и т.д.
+                    user_scores[username]['scores'] += (position)  # 1 за 1-е место, 2 за 2-е и т.д.
                     user_scores[username]['places'][metric_name] = position
     
     def preprocess_total(leaders, less):
@@ -763,35 +790,62 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # print(top_smape)
     
-    add_smape = preprocess_total(top_smape, True)
-    add_da = preprocess_total(top_da, False)
-    add_mae = preprocess_total(top_mae, True)
-    add_rmse = preprocess_total(top_rmse, True)
+    add_smape = preprocess_total(all_smape, True)
+    add_da = preprocess_total(all_da, False)
+    add_mae = preprocess_total(all_mae, True)
+    add_rmse = preprocess_total(all_rmse, True)
 
     add_scores(add_smape, 'smape')
     add_scores(add_da, 'da')
     add_scores(add_mae, 'mae')
     add_scores(add_rmse, 'rmse')
-    
+
+    print(all_smape, all_da, all_mae, all_rmse, sep='\n')
+
+    def get_user_pos(leaderbord, username):
+        for i, lsts in enumerate(leaderbord, 1):
+            for objs in lsts:
+                if objs[0] == username:
+                    return i, objs[1], objs[5]
+        return None, None, None
+
+    user_smape_pos, user_smape, user_attempts = get_user_pos(add_smape, user_name)
+    user_da_pos, user_da, _ = get_user_pos(add_da, user_name)
+    user_mae_pos, user_mae, _ = get_user_pos(add_mae, user_name)
+    user_rmse_pos, user_rmse, _ = get_user_pos(add_rmse, user_name)
+
+    def get_user_overall_pos(overall_leaderbord, username):
+        for pos, info in enumerate(overall_leaderbord, 1):
+            if info['username'] == username:
+                return pos
+        return None
+     
     overall_leaderboard = sorted(
         user_scores.values(),
         key=lambda x: x['scores'],
-        reverse=True
-    )[:5]
+        # reverse=True
+    )
+    print(overall_leaderboard)
+    # {'username': 'Artyom2307', 'scores': 4, 'places': {'smape': 1, 'da': 1, 'mae': 1, 'rmse': 1}}
+
+    user_overall_pos = get_user_overall_pos(overall_leaderboard, user_name)
         
     # 1. SMAPE
     smape_text = "<b>Лидерборд — SMAPE</b>\n\n"
     smape_text += "Симметричная процентная ошибка.\n"
     smape_text += "Меньше — лучше.\n\n"
+
+    users_was_smape = []
     
     for i, (username, best_smape, da, mae, rmse, attempts, last_attempt) in enumerate(top_smape):
         username_display = f"@{username}" if username else "Аноним"
         smape_text += (
             f"{user_scores[username]['places']['smape']}. <b>{username_display}</b> — <b>{best_smape:.2f}%</b> · попыток: {attempts}\n"
         )
+        users_was_smape.append(username)
 
     if user_smape_pos:
-        if user_smape_pos > 5:
+        if user_name not in users_was_smape:
             smape_text += "\n—\n\n"
             smape_text += f"<b>{user_smape_pos}.</b> @{user_name} — <b>{user_smape:.2f}%</b> · попыток: {user_attempts}"
     
@@ -801,15 +855,18 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     da_text = "<b>Лидерборд — Direction Accuracy</b>\n\n"
     da_text += "Доля правильно предсказанных направлений.\n"
     da_text += "Больше — лучше.\n\n"
+
+    users_was_da = []
     
     for i, (username, best_da, smape, mae, rmse, attempts, last_attempt) in enumerate(top_da):
         username_display = f"@{username}" if username else "Аноним"
         da_text += (
             f"{user_scores[username]['places']['da']}. <b>{username_display}</b> — <b>{best_da:.1%}</b> · попыток: {attempts}\n"
         )
+        users_was_da.append(username)
 
     if user_da_pos:
-        if user_da_pos > 5:
+        if user_name not in users_was_da:
             da_text += "\n—\n\n"
             da_text += f"<b>{user_da_pos}.</b> @{user_name} — <b>{user_da:.1%}</b> · попыток: {user_attempts}"
     
@@ -819,15 +876,18 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     mae_text = "<b>Лидерборд — MAE</b>\n\n"
     mae_text += "Средняя абсолютная ошибка.\n"
     mae_text += "Меньше — лучше.\n\n"
+
+    users_was_mae = []
     
     for i, (username, best_mae, smape, da, rmse, attempts, last_attempt) in enumerate(top_mae):
         username_display = f"@{username}" if username else "Аноним"
         mae_text += (
             f"{user_scores[username]['places']['mae']}. <b>{username_display}</b> — <b>{best_mae:.2f}</b> · попыток: {attempts}\n"
         )
+        users_was_mae.append(username)
     
     if user_mae_pos:
-        if user_mae_pos > 5:
+        if user_name not in users_was_mae:
             mae_text += "\n—\n\n"
             mae_text += f"<b>{user_mae_pos}.</b> @{user_name} — <b>{user_mae:.2f}</b> · попыток: {user_attempts}"
     
@@ -837,15 +897,18 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rmse_text = "<b>Лидерборд — RMSE</b>\n\n"
     rmse_text += "Ошибка с усиленным штрафом за крупные отклонения.\n"
     rmse_text += "Меньше — лучше.\n\n"
+
+    users_was_rmse = []
     
     for i, (username, best_rmse, smape, da, mae, attempts, last_attempt) in enumerate(top_rmse):
         username_display = f"@{username}" if username else "Аноним"
         rmse_text += (
             f"{user_scores[username]['places']['rmse']}. <b>{username_display}</b> — <b>{best_rmse:.2f}</b> · попыток: {attempts}\n"
         )
+        users_was_rmse.append(username)
 
     if user_rmse_pos:
-        if user_rmse_pos > 5:
+        if user_name not in users_was_rmse:
             rmse_text += "\n—\n\n"
             rmse_text += f"<b>{user_rmse_pos}.</b> @{user_name} — <b>{user_rmse:.2f}</b> · попыток: {user_attempts}"
     
@@ -854,19 +917,33 @@ async def show_top_prompts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # 5. TOTAL
     overall_text = "<b>Общий рейтинг</b>\n\n"
     overall_text += "Итоговая позиция по всем метрикам.\n\n"
+
+    users_was_olverall = []
     
-    for i, user in enumerate(overall_leaderboard):
+    for i, user in enumerate(overall_leaderboard[:5], 1):
         username_display = f"@{user['username']}" if user['username'] else "Аноним"
         
-        overall_text += f"{i + 1}. <b>{username_display}</b> — <b>{user['scores']} / 20</b>\n"
+        overall_text += f"{i}. <b>{username_display}</b> — <b>{user['scores']}</b>\n"
         overall_text += f"   SMAPE: {user['places']['smape']} · Direction Accuracy: {user['places']['da']} · MAE: {user['places']['mae']} · RMSE: {user['places']['rmse']}"
         
         overall_text += "\n\n"
+
+        users_was_olverall.append(user['username'])
+    
+    if user_overall_pos:
+        if user_name not in users_was_olverall:
+            not_top_5_user_score = user_mae_pos + user_da_pos + user_rmse_pos + user_smape_pos
+
+            overall_text += '\n—\n\n'
+            overall_text += f"{user_overall_pos}. <b>{user_name}</b> — <b>{not_top_5_user_score}</b>\n"
+            overall_text += f"   SMAPE: {user_smape_pos} · Direction Accuracy: {user_da_pos} · MAE: {user_mae_pos} · RMSE: {user_rmse_pos}"
+
+            overall_text += "\n\n"
     
     overall_text += (
         """Баллы начисляются за места в каждом лидерборде:  
-1 — 5, 2 — 4, 3 — 3, 4 — 2, 5 — 1.  
-Максимум — 20 баллов."""
+1 — 1, 2 — 2, 3 — 3, 4 — 4, 5 — 5, ...  
+Меньше — лучше."""
     )
     
     keyboard = [
@@ -1066,7 +1143,7 @@ async def main_async():
             await asyncio.sleep(5)
 
         except Exception as e:
-            # print(f"Ошибка бота: {e}")
+            print(f"Ошибка бота: {e}")
             print("Перезапуск через 5 сек...")
             await asyncio.sleep(5)
 

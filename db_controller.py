@@ -156,7 +156,7 @@ class DBController:
         samples.extend(symbol_samples)
 
         random.seed(42)        
-        random.shuffle(samples)
+        # random.shuffle(samples)
 
         if len(samples) > num_samples:
             # pass
@@ -176,12 +176,11 @@ class DBController:
         samples = []
         available_indices = list(range(window_size, len(data) - horizon))
 
-        random.seed(42)        
-        selected_indices = random.sample(
-            available_indices, 
-            min(samples_per_symbol, len(available_indices))
-        )
-        
+        rng = random.Random(42)
+        selected_indices = rng.sample(available_indices, min(samples_per_symbol, len(available_indices)))
+
+        selected_indices.sort()
+
         for idx in selected_indices:
             context_data = data.iloc[idx - window_size:idx + horizon]
             

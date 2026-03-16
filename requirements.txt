@@ -1,0 +1,10 @@
+python-telegram-bot==20.7
+aiohttp==3.12.15
+requests==2.32.4
+aiosqlite==0.21.0
+numpy==1.26.4
+pandas==2.3.3
+tqdm==4.67.1
+ollama==0.6.1
+sentence-transformers==2.6.1
+scikit-learn==1.6.1
