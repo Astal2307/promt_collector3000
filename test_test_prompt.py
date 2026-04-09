@@ -46,7 +46,7 @@ class OverallMetrics:
 
 
 class Tester:
-    def __init__(self, iam_token, folder_id, model_uri, db_controller: DBController, model="gpt-oss:120b-cloud"):
+    def __init__(self, iam_token, folder_id, model_uri, db_controller: DBController, model="deepseek-v3.1:671b-cloud"):
         self.iam_token = iam_token
         self.folder_id = folder_id
         self.model_uri = model_uri
@@ -86,8 +86,8 @@ class Tester:
             ]
         }
 
-    async def get_response(self, question_text, temperature=0.7, max_tokens=50):
-        if self.model == "gpt-oss:120b-cloud" or self.model == "qwen3-vl:235b-cloud":
+    async def get_response(self, question_text, temperature=0.0, max_tokens=50):
+        if self.model == "gpt-oss:120b-cloud" or self.model == "deepseek-v3.1:671b-cloud":
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
@@ -95,7 +95,7 @@ class Tester:
                     model=self.model,
                     prompt=question_text,
                     options={"temperature": temperature, "seed": 42},
-                    think="medium"
+                    think="low" if self.model == "gpt-oss:120b-cloud" else True
                 )
             )
 
@@ -108,7 +108,7 @@ class Tester:
                         model=self.model,
                         prompt=question_text,
                         options={"temperature": temperature},
-                        think="medium"
+                        think="medium" if self.model == "gpt-oss:120b-cloud" else True
                     )
                 )
                 print(f"ATTEMPT {i}: {response.response}")
@@ -121,6 +121,9 @@ class Tester:
             #print('==============================================================================\n\n')
             #print(f"OLLAMA RESPONSE: \n{response.response}\n")
             #print('==============================================================================\n\n')
+            print('\n')
+            print(response.response)
+            print('\n')
             return response.response
 
         elif self.model == "gemma3":

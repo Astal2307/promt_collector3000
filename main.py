@@ -65,10 +65,10 @@ test_prompt = """
 Выбери один: выбери тот сценарий, который сильнее всего похож на прошлое поведение актива, но при этом является наименее очевидным и линейным.
 """
 
-test_prompt_metrics = {'smape': 2.269,
-                       'direction_accuracy': 41.7,
-                       'mae': 1238.465,
-                       'rmse': 1722.624}
+test_prompt_metrics = {'smape': 2.11,
+                       'direction_accuracy': 60.0,
+                       'mae': 1148.16,
+                       'rmse': 1350.41}
 
 db_controller = DBController()
 

@@ -13,3 +13,5 @@ test_model.ipynb
 test_promt.py
 test_test_prompt.txt
 user_prompts.db
+AGENTS.md
+private_info.json
